@@ -1,4 +1,4 @@
-# 🕵️‍♂️ VLM-4-Deepfake: 基于 LLaVA 的深度伪造图像检测模型
+  # 🕵️‍♂️ View2Verify: A Dual-Stream Framework for Deepfake Detection.（基于VLM的深度伪造图像检测模型）
 
 本项目为本科毕业设计代码仓库。基于大型视觉语言模型 (VLM) LLaVA 架构，通过引入 SRM（Spatial Rich Model）等特定微调策略，赋予模型精准识别 Deepfake（AI生成/篡改图片）的能力。
 
