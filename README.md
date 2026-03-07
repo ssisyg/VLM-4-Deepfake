@@ -9,9 +9,7 @@
 
 ## 📁 核心文件说明
 * `predict.py`：核心推理脚本，包含模型的手动组装与图片预测逻辑。
-* `LLaVA_SRM.zip`：微调后提取的核心权重文件（LoRA + mm_projector）。
 * `cog.yaml` / `pyproject.toml`：项目环境依赖配置。
-* `train_lora_on_kaggle.ipynb`：（建议你上传后写这句）Kaggle 环境下的完整模型微调训练记录。
 
 ## 🚀 快速开始 (Quick Start)
 
