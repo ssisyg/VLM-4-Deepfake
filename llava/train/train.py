@@ -171,7 +171,9 @@ def get_mm_adapter_state_maybe_zero_3(named_params, keys_to_match):
 def find_all_linear_names(model):
     cls = torch.nn.Linear
     lora_module_names = set()
-    multimodal_keywords = ['mm_projector', 'vision_tower', 'vision_resampler']
+    # [MOD] 新增 srm_tower / srm_projector / srm_mask_head，防止 LoRA 误入新模块
+    multimodal_keywords = ['mm_projector', 'vision_tower', 'vision_resampler',
+                           'srm_tower', 'srm_projector', 'srm_mask_head']
     for name, module in model.named_modules():
         if any(mm_keyword in name for mm_keyword in multimodal_keywords):
             continue
@@ -189,8 +191,9 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
     """Collects the state dict and dump to disk."""
 
     if getattr(trainer.args, "tune_mm_mlp_adapter", False):
-        # Only save Adapter
-        keys_to_match = ['mm_projector']
+        # [MOD] 同时保存 SRM 相关新模块权重
+        keys_to_match = ['mm_projector', 'srm_projector', 'srm_mask_head',
+                         'srm_tower.cnn_backbone', 'mask_guidance_alpha']
         if getattr(trainer.args, "use_im_start_end", False):
             keys_to_match.extend(['embed_tokens', 'embed_in'])
 
@@ -614,13 +617,6 @@ def preprocess(
     tokenizer: transformers.PreTrainedTokenizer,
     has_image: bool = False
 ) -> Dict:
-    """
-    Given a list of sources, each is a conversation list. This transform:
-    1. Add signal '### ' at the beginning each sentence, with end signal '\n';
-    2. Concatenate conversations together;
-    3. Tokenize the concatenated conversation;
-    4. Make a deepcopy as the target. Mask human words with IGNORE_INDEX.
-    """
     if conversation_lib.default_conversation.sep_style == conversation_lib.SeparatorStyle.PLAIN:
         return preprocess_plain(sources, tokenizer)
     if conversation_lib.default_conversation.sep_style == conversation_lib.SeparatorStyle.LLAMA_2:
@@ -696,19 +692,19 @@ class LazySupervisedDataset(Dataset):
         if isinstance(i, int):
             sources = [sources]
         assert len(sources) == 1, "Don't know why it is wrapped to a list"  # FIXME
-        
+
         if 'image' in sources[0]:
             image_file = self.list_data_dict[i]['image']
             image_folder = self.data_args.image_folder
             processor = self.data_args.image_processor
             image = Image.open(os.path.join(image_folder, image_file)).convert('RGB')
-            
+
             # ==========================================================
-            # 【毕设新增】：在原版覆盖 image 变量之前，提前截取给 SRM 分支使用
+            # 【毕设新增】：SRM 专用预处理——中心裁剪到 336，不做插值 Resize
+            # 必须在 CLIP 的 processor.preprocess 覆盖 image 变量之前做
             # ==========================================================
-            # 使用 336 的中心裁剪，绝不进行插值 Resize
             srm_transform = T.Compose([
-                T.CenterCrop(336), 
+                T.CenterCrop(336),
                 T.ToTensor(),
             ])
             srm_image_tensor = srm_transform(image)
@@ -731,18 +727,18 @@ class LazySupervisedDataset(Dataset):
                 image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
             else:
                 image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
-                
+
             sources = preprocess_multimodal(
                 copy.deepcopy([e["conversations"] for e in sources]),
                 self.data_args)
         else:
             sources = copy.deepcopy([e["conversations"] for e in sources])
-            
+
         data_dict = preprocess(
             sources,
             self.tokenizer,
             has_image=('image' in self.list_data_dict[i]))
-            
+
         if isinstance(i, int):
             data_dict = dict(input_ids=data_dict["input_ids"][0],
                              labels=data_dict["labels"][0])
@@ -750,15 +746,15 @@ class LazySupervisedDataset(Dataset):
         # image exist in the data
         if 'image' in self.list_data_dict[i]:
             data_dict['image'] = image
-            # 【毕设新增】：将打包好的 srm_image_tensor 存入字典
-            data_dict['srm_image'] = srm_image_tensor 
+            # 【毕设新增】：将 srm_image_tensor 存入字典
+            data_dict['srm_image'] = srm_image_tensor
         elif self.data_args.is_multimodal:
             # image does not exist in the data, but the model is multimodal
             crop_size = self.data_args.image_processor.crop_size
             data_dict['image'] = torch.zeros(3, crop_size['height'], crop_size['width'])
-            # 【毕设新增】：没有图片时，为 SRM 也补齐全零矩阵（保持与 CLIP 相同分辨率的兼容性）
-            data_dict['srm_image'] = torch.zeros(3, 336, 336) 
-            
+            # 【毕设新增】：没有图片时补全零矩阵，保持 batch 维度一致
+            data_dict['srm_image'] = torch.zeros(3, 336, 336)
+
         return data_dict
 
 
@@ -794,11 +790,11 @@ class DataCollatorForSupervisedDataset(object):
                 batch['images'] = images
 
         # ==========================================================
-        # 【毕设新增】：将单条的 srm_image 打包成 batch
+        # 【毕设新增】：将 srm_image 打包成 batch
+        # CenterCrop(336) 保证每张 shape 一致，可以直接 stack
         # ==========================================================
         if 'srm_image' in instances[0]:
             srm_images = [instance['srm_image'] for instance in instances]
-            # 因为咱们之前做了严格的 CenterCrop(336)，理论上 shape 都是绝对一致的
             if all(x is not None and x.shape == srm_images[0].shape for x in srm_images):
                 batch['srm_images'] = torch.stack(srm_images)
             else:
@@ -826,12 +822,9 @@ def train(attn_implementation=None):
     parser = transformers.HfArgumentParser(
         (ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
-    
-    # ==========================================================
-    # 【毕设新增 1】：关键！防止 Hugging Face Trainer 自动丢弃 srm_images 字段
-    # ==========================================================
+
+    # 【原有】防止 Trainer 自动丢弃 srm_images 字段
     training_args.remove_unused_columns = False
-    # ==========================================================
 
     local_rank = training_args.local_rank
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
@@ -954,9 +947,18 @@ def train(attn_implementation=None):
             model_args=model_args,
             fsdp=training_args.fsdp
         )
-        
+
         vision_tower = model.get_vision_tower()
         vision_tower.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
+
+        # [MOD] 同步把 SRM 新模块也移到正确的 dtype 和 device
+        srm_tower = getattr(model.get_model(), 'srm_tower', None)
+        srm_projector = getattr(model.get_model(), 'srm_projector', None)
+        srm_mask_head = getattr(model.get_model(), 'srm_mask_head', None)
+        target_dtype = torch.bfloat16 if training_args.bf16 else torch.float16
+        for module in [srm_tower, srm_projector, srm_mask_head]:
+            if module is not None:
+                module.to(dtype=target_dtype, device=training_args.device)
 
         data_args.image_processor = vision_tower.image_processor
         data_args.is_multimodal = True
@@ -999,20 +1001,50 @@ def train(attn_implementation=None):
                         module = module.to(torch.bfloat16)
 
     # ==========================================================
-    # 【毕设新增 2】：无论其他部分怎么冻结，强行打开 SRM 分支的梯度！
+    # 【毕设修改】：完整的 SRM 新模块梯度解冻
+    # 覆盖原来只解冻 srm_projector + cnn_backbone 的不完整版本
     # ==========================================================
     rank0_print("Unfreezing SRM branch parameters...")
+    srm_keywords = [
+        'srm_tower',          # SRMVisionTower 整体（含 SRM 固定滤波器 + CNN backbone）
+        'srm_projector',      # Projector2：频率特征 → LLM 维度
+        'srm_mask_head',      # 掩码生成头：1×1 Conv + Sigmoid
+        'mask_guidance_alpha', # 可学习引导强度 α
+    ]
     for name, param in model.named_parameters():
-        if "srm_projector" in name or "srm_tower.cnn_backbone" in name:
+        if any(kw in name for kw in srm_keywords):
             param.requires_grad = True
+            rank0_print(f"  [trainable] {name}")
+
+    # 打印可训练参数总量，方便 debug
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters())
+    rank0_print(f"Trainable: {trainable_params:,} / Total: {total_params:,} "
+                f"({100 * trainable_params / total_params:.2f}%)")
     # ==========================================================
 
     data_module = make_supervised_data_module(tokenizer=tokenizer,
                                               data_args=data_args)
-    trainer = LLaVATrainer(model=model,
-                    tokenizer=tokenizer,
-                    args=training_args,
-                    **data_module)
+
+    # ==========================================================
+    # 【毕设新增】：自定义 LLaVATrainer，让它把 srm_images 传给 forward
+    # ==========================================================
+    from llava.train.llava_trainer import LLaVATrainer as _BaseLLaVATrainer
+
+    class SRMLLaVATrainer(_BaseLLaVATrainer):
+        def compute_loss(self, model, inputs, return_outputs=False):
+            # 从 batch 里单独取出 srm_images，传给模型 forward
+            srm_images = inputs.pop('srm_images', None)
+            if srm_images is not None:
+                inputs['srm_images'] = srm_images
+            return super().compute_loss(model, inputs, return_outputs)
+    # ==========================================================
+
+    trainer = SRMLLaVATrainer(          # [MOD] 用子类替换原来的 LLaVATrainer
+        model=model,
+        tokenizer=tokenizer,
+        args=training_args,
+        **data_module)
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)
