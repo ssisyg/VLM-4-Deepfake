@@ -17,6 +17,7 @@ from abc import ABC, abstractmethod
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F                          # [NEW] 用于 mask 插值对齐
 
 from .multimodal_encoder.builder import build_vision_tower
 from .multimodal_projector.builder import build_vision_projector
@@ -26,6 +27,44 @@ from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATCH
 from llava.mm_utils import get_anyres_image_grid_shape
 
 from .srm_encoder import SRMVisionTower, SRMProjector
+
+
+# ==============================================================
+# [NEW] 掩码生成头：把 SRM 的空间特征图转成引导 CLIP 的 patch mask
+# 单独定义成一个小模块，方便在 initialize_vision_modules 里初始化
+# ==============================================================
+class SRMMaskHead(nn.Module):
+    """
+    输入：SRM 的空间特征图 (B, srm_hidden_size, H_srm, W_srm)
+    输出：与 CLIP patch token 对齐的软掩码 (B, N_clip_patches)
+
+    只有一个 1×1 Conv + Sigmoid，参数量极少，不会给训练增加负担。
+    """
+    def __init__(self, srm_hidden_size: int, num_clip_patches: int = 576):
+        super().__init__()
+        # 1×1 Conv 把通道数压到 1，再 Sigmoid 得到 [0,1] 软掩码
+        self.conv = nn.Conv2d(srm_hidden_size, 1, kernel_size=1)
+        self.sigmoid = nn.Sigmoid()
+        self.num_clip_patches = num_clip_patches  # 24×24=576（ViT-L/14@336）
+
+    def forward(self, srm_spatial_feat: torch.Tensor) -> torch.Tensor:
+        """
+        srm_spatial_feat: (B, C, H, W)  SRM CNN 中间层的空间特征图
+        返回: (B, N)  N = num_clip_patches，软掩码，值域 [0,1]
+        """
+        # 1×1 Conv → (B, 1, H, W)
+        mask = self.sigmoid(self.conv(srm_spatial_feat))  # (B, 1, H, W)
+
+        # 插值到 CLIP patch 分辨率（24×24）
+        n = int(self.num_clip_patches ** 0.5)             # 24
+        mask = F.interpolate(
+            mask, size=(n, n), mode='bilinear', align_corners=False
+        )                                                  # (B, 1, 24, 24)
+
+        # 展平成序列，对应 CLIP 的 patch token 顺序
+        mask = mask.squeeze(1).flatten(1)                  # (B, 576)
+        return mask
+
 
 class LlavaMetaModel:
 
@@ -91,7 +130,7 @@ class LlavaMetaModel:
                 p.requires_grad = True
 
         # ==========================================================
-        # 【毕设新增代码】：初始化 SRM 分支与 Projector2
+        # 【毕设新增代码】：初始化 SRM 分支、Projector2、掩码头、引导强度
         # ==========================================================
         if getattr(self, 'srm_tower', None) is None:
             self.srm_tower = SRMVisionTower()
@@ -99,10 +138,27 @@ class LlavaMetaModel:
                 srm_hidden_size=self.srm_tower.hidden_size,
                 llm_hidden_size=self.config.hidden_size
             )
+
+            # [NEW] 掩码生成头
+            # srm_tower.hidden_size 是 SRM CNN 最后一层的通道数
+            # num_clip_patches=576 对应 ViT-L/14@336（24×24 个 patch）
+            self.srm_mask_head = SRMMaskHead(
+                srm_hidden_size=self.srm_tower.hidden_size,
+                num_clip_patches=576,
+            )
+
+            # [NEW] 可学习的引导强度 α，初始值 0.5
+            # 让模型自己学习"SRM 对 CLIP 的影响应该有多强"
+            self.mask_guidance_alpha = nn.Parameter(
+                torch.tensor(0.5)
+            )
         else:
-            # 确保在 LoRA 冻结时，srm_projector 依然保持可训练
+            # 确保在 LoRA 冻结时，新模块依然保持可训练
             for p in self.srm_projector.parameters():
                 p.requires_grad = True
+            for p in self.srm_mask_head.parameters():       # [NEW]
+                p.requires_grad = True
+            self.mask_guidance_alpha.requires_grad = True   # [NEW]
         # ==========================================================
 
         if pretrain_mm_mlp_adapter is not None:
@@ -154,40 +210,112 @@ class LlavaMetaForCausalLM(ABC):
         return self.get_model().get_vision_tower()
 
     # ==========================================================
-    # 【毕设修改】：增加 srm_images 参数，优先使用不经过 Resize 的图像
+    # 【毕设修改】encode_images：加入掩码引导逻辑
+    #
+    # 完整数据流：
+    #   images
+    #     ├─► CLIP-ViT ──────────────────────────────────────────────────────┐
+    #     │                                                                   │
+    #     └─► SRM Filter → CNN Encoder                                        │
+    #                           ├─► srm_mask_head → spatial_mask (B,576)     │
+    #                           │        ↓  点乘引导 (⊗)                      │
+    #                           │   CLIP patch tokens × (1 + α×mask) ────────┘
+    #                           │        ↓
+    #                           │   mm_projector → semantic_tokens (B,N,llm_dim)
+    #                           │
+    #                           └─► srm_projector → freq_tokens (B,M,llm_dim)
+    #
+    #   fused = cat(semantic_tokens, freq_tokens)  →  LLM
     # ==========================================================
     def encode_images(self, images, srm_images=None):
-        # 1. 提取 CLIP 语义特征
-        image_features = self.get_model().get_vision_tower()(images)
-        image_features = self.get_model().mm_projector(image_features)
+        model = self.get_model()
 
-        # 2. 获取 SRM 分支 (增加容错判断，确保分支存在)
-        srm_tower = getattr(self.get_model(), 'srm_tower', None)
-        srm_projector = getattr(self.get_model(), 'srm_projector', None)
+        # ── Step 1: CLIP-ViT 提取 patch tokens ─────────────────
+        # clip_tokens shape: (B, N+1, clip_hidden)
+        # N+1 = 1(CLS) + 576(patches)，ViT-L/14@336
+        clip_tokens = model.get_vision_tower()(images)   # (B, 577, 1024)
+
+        # ── Step 2: SRM 分支 ────────────────────────────────────
+        srm_tower     = getattr(model, 'srm_tower',     None)
+        srm_projector = getattr(model, 'srm_projector', None)
+        srm_mask_head = getattr(model, 'srm_mask_head', None)
+        alpha         = getattr(model, 'mask_guidance_alpha', None)
 
         if srm_tower is not None and srm_projector is not None:
-            # 【核心逻辑】：优先使用专门裁剪的 srm_images，如果没有则退化为 images（兼容单模态推理）
             actual_srm_inputs = srm_images if srm_images is not None else images
 
-            # 自动对齐设备和数据类型（防止半精度训练时报错）
-            srm_tower.to(device=actual_srm_inputs.device, dtype=actual_srm_inputs.dtype)
-            srm_projector.to(device=actual_srm_inputs.device, dtype=actual_srm_inputs.dtype)
-            
-            # 提取 SRM 频域特征
-            srm_features = srm_tower(actual_srm_inputs)
-            srm_features = srm_projector(srm_features)
-            
-            # 3. 双流特征序列级拼接 (dim=1 为序列维度)
+            # 对齐设备与精度（半精度训练时必须）
+            srm_tower.to(device=actual_srm_inputs.device,
+                         dtype=actual_srm_inputs.dtype)
+            srm_projector.to(device=actual_srm_inputs.device,
+                             dtype=actual_srm_inputs.dtype)
+
+            # SRM 前向：返回 (srm_feat, srm_spatial)
+            # srm_feat:    (B, M, srm_hidden)  用于 Projector2
+            # srm_spatial: (B, srm_hidden, H_srm, W_srm)  用于生成 mask
+            # ──────────────────────────────────────────────────
+            # 注意：你需要让 SRMVisionTower.forward() 同时返回这两个值
+            # 如果原来只返回 srm_feat，见文件末尾的修改说明
+            # ──────────────────────────────────────────────────
+            srm_feat, srm_spatial = srm_tower(actual_srm_inputs)
+
+            # ── Step 3: 掩码生成 ──────────────────────────────
+            if srm_mask_head is not None and alpha is not None:
+                srm_mask_head.to(device=actual_srm_inputs.device,
+                                 dtype=actual_srm_inputs.dtype)
+
+                # spatial_mask: (B, 576)，值域 [0,1]
+                # 1 = SRM 认为该 patch 频率异常（疑似伪造）
+                # 0 = 该 patch 频率正常
+                spatial_mask = srm_mask_head(srm_spatial)  # (B, 576)
+
+                # ── Step 4: 掩码引导 CLIP patch tokens ──────────
+                # clip_tokens[:, 0, :]  → CLS token，不动
+                # clip_tokens[:, 1:, :] → patch tokens，用 mask 增强
+                #
+                # 公式：patch' = patch × (1 + α × mask)
+                #   mask=0 → patch' = patch        （正常区域，原样保留）
+                #   mask=1 → patch' = patch × (1+α) （异常区域，额外强调）
+                cls_token    = clip_tokens[:, :1, :]   # (B, 1, 1024)
+                patch_tokens = clip_tokens[:, 1:, :]   # (B, 576, 1024)
+
+                # α 限幅防止梯度爆炸
+                alpha_clamped = torch.clamp(alpha, 0.0, 2.0)
+
+                # mask: (B, 576) → (B, 576, 1) 广播到特征维度
+                mask_expanded = spatial_mask.unsqueeze(-1)          # (B, 576, 1)
+                guided_patches = patch_tokens * (1.0 + alpha_clamped * mask_expanded)
+
+                # 拼回 CLS token，形状与原始 CLIP 输出完全一致
+                clip_tokens = torch.cat([cls_token, guided_patches], dim=1)
+                # (B, 577, 1024)，可以直接送进原有 mm_projector
+
+            # ── Step 5: Projector1 —— 引导后的语义 tokens ────────
+            # mm_projector 把 (B, 577, 1024) → (B, 577, llm_hidden)
+            image_features = model.mm_projector(clip_tokens)   # (B, 577, llm_dim)
+
+            # ── Step 6: Projector2 —— 频率物证 tokens ────────────
+            srm_features = srm_projector(srm_feat)             # (B, M, llm_dim)
+
+            # ── Step 7: 融合（token 级别 concat）─────────────────
+            # 最终 token 序列 = [语义 tokens | 频率 tokens]
+            # LLM 既能看到"哪里看起来不自然"又能看到"具体的频率物证"
             image_features = torch.cat([image_features, srm_features], dim=1)
+            # (B, 577+M, llm_dim)
+
+        else:
+            # 退化模式：没有 SRM 分支时走原有逻辑（兼容单模态推理）
+            image_features = model.mm_projector(clip_tokens)
 
         return image_features
 
     # ==========================================================
-    # 【毕设修改】：增加 srm_images 参数，并将其透传给 encode_images
+    # 【毕设修改】：增加 srm_images 参数，透传给 encode_images
+    # 其余逻辑与原版完全相同，只在两处调用 encode_images 的地方加了参数
     # ==========================================================
     def prepare_inputs_labels_for_multimodal(
         self, input_ids, position_ids, attention_mask, past_key_values, labels,
-        images, image_sizes=None, srm_images=None # <--- 新增 srm_images 接收端
+        images, image_sizes=None, srm_images=None
     ):
         vision_tower = self.get_vision_tower()
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
@@ -197,10 +325,10 @@ class LlavaMetaForCausalLM(ABC):
             if type(images) is list:
                 images = [x.unsqueeze(0) if x.ndim == 3 else x for x in images]
             concat_images = torch.cat([image for image in images], dim=0)
-            
-            # 【透传修改 1】：传给 encode_images
+
+            # [MOD] 透传 srm_images
             image_features = self.encode_images(concat_images, srm_images=srm_images)
-            
+
             split_sizes = [image.shape[0] for image in images]
             image_features = torch.split(image_features, split_sizes, dim=0)
             mm_patch_merge_type = getattr(self.config, 'mm_patch_merge_type', 'flat')
@@ -245,17 +373,13 @@ class LlavaMetaForCausalLM(ABC):
             else:
                 raise ValueError(f"Unexpected mm_patch_merge_type: {self.config.mm_patch_merge_type}")
         else:
-            # 【透传修改 2】：传给 encode_images
+            # [MOD] 透传 srm_images
             image_features = self.encode_images(images, srm_images=srm_images)
 
         # TODO: image start / end is not implemented here to support pretraining.
         if getattr(self.config, 'tune_mm_mlp_adapter', False) and getattr(self.config, 'mm_use_im_start_end', False):
             raise NotImplementedError
 
-        # Let's just add dummy tensors if they do not exist,
-        # it is a headache to deal with None all the time.
-        # But it is not ideal, and if you have a better idea,
-        # please open an issue / submit a PR, thanks.
         _labels = labels
         _position_ids = position_ids
         _attention_mask = attention_mask
@@ -268,7 +392,6 @@ class LlavaMetaForCausalLM(ABC):
         if labels is None:
             labels = torch.full_like(input_ids, IGNORE_INDEX)
 
-        # remove the padding using attention_mask -- FIXME
         _input_ids = input_ids
         input_ids = [cur_input_ids[cur_attention_mask] for cur_input_ids, cur_attention_mask in zip(input_ids, attention_mask)]
         labels = [cur_labels[cur_attention_mask] for cur_labels, cur_attention_mask in zip(labels, attention_mask)]
@@ -310,20 +433,17 @@ class LlavaMetaForCausalLM(ABC):
                     cur_new_labels.append(torch.full((cur_image_features.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
 
             cur_new_input_embeds = [x.to(self.device) for x in cur_new_input_embeds]
-
             cur_new_input_embeds = torch.cat(cur_new_input_embeds)
             cur_new_labels = torch.cat(cur_new_labels)
 
             new_input_embeds.append(cur_new_input_embeds)
             new_labels.append(cur_new_labels)
 
-        # Truncate sequences to max length as image embeddings can make the sequence longer
         tokenizer_model_max_length = getattr(self.config, 'tokenizer_model_max_length', None)
         if tokenizer_model_max_length is not None:
             new_input_embeds = [x[:tokenizer_model_max_length] for x in new_input_embeds]
             new_labels = [x[:tokenizer_model_max_length] for x in new_labels]
 
-        # Combine them
         max_len = max(x.shape[0] for x in new_input_embeds)
         batch_size = len(new_input_embeds)
 
@@ -413,3 +533,25 @@ class LlavaMetaForCausalLM(ABC):
                     p.requires_grad = False
                 for p in self.get_output_embeddings().parameters():
                     p.requires_grad = False
+
+
+# ==============================================================
+# [NEW] SRMVisionTower 修改说明
+# ==============================================================
+# 你的 srm_encoder.py 里的 SRMVisionTower.forward() 目前只返回
+# srm_feat（用于 Projector2）。
+#
+# 为了让 encode_images 能拿到 srm_spatial（用于生成掩码），
+# 需要让 forward() 同时返回两个值。
+#
+# 在你的 srm_encoder.py 里找到 SRMVisionTower.forward()，改成：
+#
+#   def forward(self, x):
+#       srm_residual = self.srm_filter(x)      # SRM 固定滤波
+#       srm_spatial  = self.cnn_encoder(srm_residual)  # CNN 空间特征图
+#       srm_feat     = self.pool(srm_spatial)  # 全局池化 → token 序列
+#       return srm_feat, srm_spatial           # ← 返回两个值
+#
+# 如果你的 CNN encoder 和 pool 是一整个 nn.Sequential，
+# 把它拆成两段，中间截出 srm_spatial 即可。
+# ==============================================================
